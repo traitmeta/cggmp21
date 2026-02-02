@@ -1,3 +1,4 @@
+mod dynamic_reshare;
 mod key_refresh;
 mod keygen;
 mod old_shares;

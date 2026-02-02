@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 
 round-based = { workspace = true, features = ["derive", "sim", "state-machine"] }
 generic-ec = { workspace = true, features = ["serde", "all-curves"] }
+generic-ec-zkp = { workspace = true }
 
 bpaf = "0.7"
 include_dir = "0.7"

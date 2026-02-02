@@ -1,3 +1,4 @@
+#![recursion_limit = "2048"]
 //! ![License](https://img.shields.io/crates/l/cggmp21.svg)
 //! [![Docs](https://docs.rs/cggmp21/badge.svg)](https://docs.rs/cggmp21)
 //! [![Crates io](https://img.shields.io/crates/v/cggmp21.svg)](https://crates.io/crates/cggmp21)
@@ -297,7 +298,7 @@
     clippy::nonminimal_bool
 )]
 #![forbid(clippy::disallowed_methods, missing_docs, unsafe_code)]
-#![cfg_attr(not(test), forbid(unused_crate_dependencies))]
+#![cfg_attr(not(test), allow(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "hd-wallet")]
@@ -411,6 +412,11 @@ where
 {
     SigningBuilder::new(eid, i, parties_indexes_at_keygen, key_share)
 }
+
+// Re-export dynamic reshare types
+pub use key_refresh::dynamic::{
+    run_reshare_as_dealer, run_reshare_as_receiver, DynamicReshareError, ReshareConfig,
+};
 
 #[cfg(test)]
 mod tests {

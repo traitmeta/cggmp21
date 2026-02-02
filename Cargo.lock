@@ -354,6 +354,7 @@ dependencies = [
  "criterion",
  "futures",
  "generic-ec",
+ "generic-ec-zkp",
  "hex",
  "include_dir",
  "lazy_static",
@@ -1646,7 +1647,8 @@ dependencies = [
 [[package]]
 name = "paillier-zk"
 version = "0.4.3"
-source = "git+https://github.com/dfnsco/paillier-zk-private-security-fix?branch=cggmp21%2Fsecurity-fix#e3383915bc703a26b8ffb42aa346a675f6529f8e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9963224009a2fd339cffd8f6c5c35fc9a91732b89acd4b0ed34c30afe70a193"
 dependencies = [
  "digest",
  "fast-paillier",

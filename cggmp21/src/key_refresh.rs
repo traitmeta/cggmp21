@@ -2,6 +2,8 @@
 
 /// Auxiliary info (re)generation protocol specific types
 mod aux_only;
+/// Dynamic reshare protocol for participant replacement
+pub mod dynamic;
 /// Non-threshold key refresh specific types
 mod non_threshold;
 
@@ -36,6 +38,13 @@ pub mod msg {
     pub mod non_threshold {
         pub use crate::key_refresh::non_threshold::{
             Msg, MsgReliabilityCheck, MsgRound1, MsgRound2, MsgRound3,
+        };
+    }
+    /// Messages types related to dynamic reshare protocol
+    pub mod dynamic {
+        pub use crate::key_refresh::dynamic::{
+            Msg, MsgAuxInfo, MsgFeldmanCommitment, MsgFinalProofs, MsgReliabilityCheck,
+            MsgShareDistribution,
         };
     }
 }
@@ -367,6 +376,8 @@ enum Bug {
     BuildCrt,
     #[error("updated share is zero - probability of that is negligible")]
     ZeroShare,
+    #[error("Party index out of bounds")]
+    PartyIndexOutOfBounds,
 }
 
 /// Error indicating that protocol was aborted by malicious party
