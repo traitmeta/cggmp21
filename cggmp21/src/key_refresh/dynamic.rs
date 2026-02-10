@@ -1142,8 +1142,8 @@ where
     // 由于是加法秘密共享的再共享，所有分片的和即为新的私钥 x_new。
     let new_share: Scalar<E> = share_msgs.values().map(|m| m.share).sum();
 
-    // Compute Public Shares (Y_j) for EVERYONE
-    // Implement Sparse ID Support: Generate shares up to max_id
+    // Compute Public Shares (Y_j) for all indices up to max_id
+    // This supports sparse indices while maintaining the invariant that public_shares[i] exists
     let max_id = config.new_parties.iter().max().copied().unwrap_or(0);
     let new_public_shares: Vec<NonZero<Point<E>>> = (0..=max_id)
         .map(|j| {
@@ -1308,6 +1308,7 @@ where
         .map_err(|_| DynamicReshareError::InvalidShare(*party_idx))?;
 
         // Verify Schnorr
+        // Use party_idx for public_shares array access since public_shares is padded to max_id+1
         if msg.public_share != public_shares[*party_idx as usize].into_inner() {
             return Err(DynamicReshareError::InvalidShare(*party_idx));
         }
@@ -1336,6 +1337,10 @@ where
     // Assemble KeyShare
     // 组装最终的 KeyShare 结构体
     // 包含：新私钥、共享公钥、所有人的验证参数 (VssSetup) 和这一轮确定的 AuxInfo。
+    //
+    // 关键设计：
+    // - public_shares: 填充到 max_id + 1，支持稀疏索引访问 public_shares[i]
+    // - vss_setup.I: 只包含实际参与者的索引，不填充
     let new_core_share = DirtyIncompleteKeyShare {
         i: my_new_index,
         key_info: DirtyKeyInfo {
@@ -1344,8 +1349,11 @@ where
             public_shares,
             vss_setup: Some(crate::key_share::VssSetup {
                 min_signers: n_new,
-                I: (0..=max_id)
-                    .map(|i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
+                // 使用实际参与者的索引，不填充
+                I: config
+                    .new_parties
+                    .iter()
+                    .map(|&i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
                     .collect(),
             }),
             #[cfg(feature = "hd-wallet")]
@@ -1356,7 +1364,8 @@ where
     .validate()
     .map_err(|err| Bug::InvalidShareGenerated(err.into_error().into()))?;
 
-    // Pad AuxInfo values for Sparse ID Support
+    // Pad AuxInfo values to support sparse indices
+    // aux.parties[i] should correspond to the aux info of party with index i
     let mut final_auxes = vec![verified_auxes[0].clone(); max_id as usize + 1];
     for (idx, party_idx) in config.new_parties.iter().enumerate() {
         final_auxes[*party_idx as usize] = verified_auxes[idx].clone();
