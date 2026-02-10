@@ -1349,11 +1349,10 @@ where
             public_shares,
             vss_setup: Some(crate::key_share::VssSetup {
                 min_signers: n_new,
-                // 使用实际参与者的索引，不填充
-                I: config
-                    .new_parties
-                    .iter()
-                    .map(|&i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
+                // 必须填充到 max_id + 1，与 public_shares 保持一致
+                // 这是 cggmp21 VSS 设计的要求：I 和 public_shares 通过 zip 一一对应
+                I: (0..=max_id)
+                    .map(|i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
                     .collect(),
             }),
             #[cfg(feature = "hd-wallet")]
