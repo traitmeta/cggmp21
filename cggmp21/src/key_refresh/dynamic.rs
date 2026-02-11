@@ -1352,13 +1352,15 @@ where
     // 组装最终的 KeyShare 结构体
     // 包含：新私钥、共享公钥、所有人的验证参数 (VssSetup) 和这一轮确定的 AuxInfo。
     //
-    // 关键设计：
-    // - public_shares: 只包含实际参与者，不填充
-    // - vss_setup.I: 只包含实际参与者的索引，不填充
-    // - aux.parties: 只包含实际参与者，不填充
-    // 这要求 new_parties 必须是连续的索引 (0, 1, 2, ...)
+    // 关键设计（position-based）：
+    // - i: 使用 my_position（在 new_parties 中的位置索引，0-based），
+    //   而非 my_new_index（协议层的 party ID），确保 0 <= i < public_shares.len()
+    // - public_shares: 只包含实际参与者，按 new_parties 顺序排列（长度 = n_new）
+    // - vss_setup.I: 存储求值点 Scalar(party_id+1)，用于 Lagrange 插值（长度 = n_new）
+    // - aux.parties: 按 new_parties 顺序排列（长度 = n_new）
+    // - 由于 i 是位置索引，new_parties 可以是任意非连续的 party ID
     let new_core_share = DirtyIncompleteKeyShare {
-        i: my_new_index,
+        i: my_position as u16,
         key_info: DirtyKeyInfo {
             curve: CurveName::new(),
             shared_public_key: config.shared_public_key,
