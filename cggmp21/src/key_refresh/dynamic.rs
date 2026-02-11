@@ -611,13 +611,19 @@ where
     let my_old_index = old_core.i;
 
     // Verify if we are retained (present in new_parties as ID)
-    // 验证我们是否被留任（作为新参与者存在）。我们需要通过 ID 而非位置来查找，以支持稀疏 ID。
-    let is_retained = config.new_party_position(my_old_index).is_some();
-    let my_new_index = if is_retained {
-        Some(my_old_index)
-    } else {
-        None
-    };
+    // 验证我们是否被留任（作为新参与者存在）。
+    //
+    // 关键修改：retained party 的新索引可能与旧索引不同！
+    // 我们通过在 new_parties 中查找 my_old_index 来确定新索引。
+    // 如果找到，说明被留任，新索引是在 new_parties 中的位置对应的值。
+    let my_new_index_option = config
+        .new_parties
+        .iter()
+        .find(|&&idx| idx == my_old_index)
+        .copied();
+
+    let is_retained = my_new_index_option.is_some();
+    let my_new_index = my_new_index_option;
 
     tracer.stage("Setup networking");
     let MpcParty { delivery, .. } = party.into_party();
@@ -1142,11 +1148,12 @@ where
     // 由于是加法秘密共享的再共享，所有分片的和即为新的私钥 x_new。
     let new_share: Scalar<E> = share_msgs.values().map(|m| m.share).sum();
 
-    // Compute Public Shares (Y_j) for all indices up to max_id
-    // This supports sparse indices while maintaining the invariant that public_shares[i] exists
-    let max_id = config.new_parties.iter().max().copied().unwrap_or(0);
-    let new_public_shares: Vec<NonZero<Point<E>>> = (0..=max_id)
-        .map(|j| {
+    // Compute Public Shares (Y_j) for actual new participants only
+    // 只为实际的新参与者计算 public_shares，不填充
+    let new_public_shares: Vec<NonZero<Point<E>>> = config
+        .new_parties
+        .iter()
+        .map(|&j| {
             let x = Scalar::<E>::from(j + 1);
             let mut public_share = Point::<E>::zero();
 
@@ -1163,7 +1170,11 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let my_public_share = *new_public_shares[my_new_index as usize];
+    // 使用位置索引访问 public_shares
+    let my_position = config
+        .new_party_position(my_new_index)
+        .ok_or(DynamicReshareError::ConfigurationMismatch)?;
+    let my_public_share = *new_public_shares[my_position];
     let secret_share = SecretScalar::new(&mut new_share.clone());
     let public_shares = new_public_shares;
 
@@ -1308,8 +1319,11 @@ where
         .map_err(|_| DynamicReshareError::InvalidShare(*party_idx))?;
 
         // Verify Schnorr
-        // Use party_idx for public_shares array access since public_shares is padded to max_id+1
-        if msg.public_share != public_shares[*party_idx as usize].into_inner() {
+        // Use position-based access since public_shares is not padded
+        let party_position = config
+            .new_party_position(*party_idx)
+            .ok_or(DynamicReshareError::ConfigurationMismatch)?;
+        if msg.public_share != public_shares[party_position].into_inner() {
             return Err(DynamicReshareError::InvalidShare(*party_idx));
         }
 
@@ -1339,8 +1353,10 @@ where
     // 包含：新私钥、共享公钥、所有人的验证参数 (VssSetup) 和这一轮确定的 AuxInfo。
     //
     // 关键设计：
-    // - public_shares: 填充到 max_id + 1，支持稀疏索引访问 public_shares[i]
+    // - public_shares: 只包含实际参与者，不填充
     // - vss_setup.I: 只包含实际参与者的索引，不填充
+    // - aux.parties: 只包含实际参与者，不填充
+    // 这要求 new_parties 必须是连续的索引 (0, 1, 2, ...)
     let new_core_share = DirtyIncompleteKeyShare {
         i: my_new_index,
         key_info: DirtyKeyInfo {
@@ -1349,10 +1365,12 @@ where
             public_shares,
             vss_setup: Some(crate::key_share::VssSetup {
                 min_signers: n_new,
-                // 必须填充到 max_id + 1，与 public_shares 保持一致
-                // 这是 cggmp21 VSS 设计的要求：I 和 public_shares 通过 zip 一一对应
-                I: (0..=max_id)
-                    .map(|i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
+                // 只包含实际参与者的索引，不填充
+                // I 和 public_shares 通过 zip 一一对应
+                I: config
+                    .new_parties
+                    .iter()
+                    .map(|&i| NonZero::from_scalar(Scalar::from(i + 1)).expect("non-zero"))
                     .collect(),
             }),
             #[cfg(feature = "hd-wallet")]
@@ -1363,12 +1381,9 @@ where
     .validate()
     .map_err(|err| Bug::InvalidShareGenerated(err.into_error().into()))?;
 
-    // Pad AuxInfo values to support sparse indices
-    // aux.parties[i] should correspond to the aux info of party with index i
-    let mut final_auxes = vec![verified_auxes[0].clone(); max_id as usize + 1];
-    for (idx, party_idx) in config.new_parties.iter().enumerate() {
-        final_auxes[*party_idx as usize] = verified_auxes[idx].clone();
-    }
+    // 不填充 AuxInfo，直接使用 verified_auxes
+    // 这要求 new_parties 是连续的，这样 aux.parties[i] 对应索引为 i 的参与者
+    let final_auxes = verified_auxes;
 
     let aux = DirtyAuxInfo {
         p: p.clone(),

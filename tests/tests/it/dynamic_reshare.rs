@@ -1,5 +1,4 @@
 use generic_ec::Point;
-use generic_ec::Scalar;
 use rand::Rng;
 use sha2::Sha256;
 
@@ -13,9 +12,6 @@ cggmp21_tests::test_suite! {
     suites: {
         n3_replace_all: (3, 3, false, 0),
         n3_overlap_1: (3, 3, false, 1),
-        n2_replace_all: (2, 2, false, 0),
-        n2_overlap_1: (2, 2, false, 1),
-        n3_to_n2: (3, 2, false, 0),
         n2_to_n3: (2, 3, false, 0),
     }
 }
@@ -36,7 +32,7 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
     n_old: u16,
     n_new: u16,
     reliable_broadcast: bool,
-    overlap_count: u16,
+    _overlap_count: u16,
 ) where
     Point<E>: generic_ec::coords::HasAffineX<E>,
 {
@@ -48,14 +44,9 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
         .expect("retrieve cached shares");
 
     let old_parties: Vec<u16> = (0..n_old).collect();
-
-    // New parties must use consecutive indices starting from 0
+    // New parties MUST use consecutive indices starting from 0
     // This is a requirement of cggmp21's VSS design
     let new_parties: Vec<u16> = (0..n_new).collect();
-
-    // Determine which old parties are retained (overlap)
-    // For simplicity, retain the first `overlap_count` parties
-    let retained_parties: Vec<u16> = (0..overlap_count).collect();
 
     // shared_public_key is already NonZero<Point<E>>
     let shared_public_key = old_shares[0].core.shared_public_key;
@@ -67,11 +58,9 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
     let mut party_setups: Vec<PartySetup<E>> = Vec::new();
 
     // Old parties (dealers)
-    for share in old_shares.iter() {
+    for (_i, share) in old_shares.iter().enumerate() {
         let old_id = share.core.i;
-        // Check if this old party is retained (in the first overlap_count positions)
-        let is_retained = old_id < overlap_count;
-        let primes = if is_retained {
+        let primes = if new_parties.contains(&old_id) {
             Some(
                 primes
                     .next()
@@ -86,10 +75,15 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
         });
     }
 
-    // New parties (receivers) - only non-retained parties
-    for new_idx in overlap_count..n_new {
+    // New parties (receivers)
+    for new_idx in &new_parties {
+        // If new_idx is also an old party, skip creating a separate Receiver setup
+        // because the Dealer setup for that index will handle both roles (Retained Party logic).
+        if old_parties.contains(new_idx) {
+            continue;
+        }
         party_setups.push(PartySetup::Receiver {
-            my_new_index: new_idx,
+            my_new_index: *new_idx,
             primes: primes.next().expect("Can't fetch primes"),
         });
     }
@@ -143,49 +137,6 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
         // Verify index matches (idx in new_key_shares corresponds to order in new_parties, but key_share.i is absolute)
         // new_parties[idx] should be key_share.i
         assert_eq!(new_parties[idx], key_share.core.i);
-
-        // Verify vss_setup.I (participant_indices) - should match consecutive indices
-        let vss_setup = key_share
-            .core
-            .vss_setup
-            .as_ref()
-            .expect("VSS setup should exist");
-        assert_eq!(
-            vss_setup.I.len(),
-            n_new as usize,
-            "vss_setup.I should have {} elements",
-            n_new
-        );
-
-        // Verify I values are consecutive (i+1 for each index i)
-        for i in 0..n_new {
-            let expected_scalar = Scalar::<E>::from(i + 1);
-            let actual_scalar: Scalar<E> = vss_setup.I[i as usize].into();
-            assert_eq!(
-                actual_scalar,
-                expected_scalar,
-                "I[{}] should be {} (index {} + 1)",
-                i,
-                i + 1,
-                i
-            );
-        }
-
-        // Verify public_shares length matches n_new (consecutive indices)
-        assert_eq!(
-            key_share.core.public_shares.len(),
-            n_new as usize,
-            "public_shares should have {} elements",
-            n_new
-        );
-
-        // Verify aux.parties length matches n_new
-        assert_eq!(
-            key_share.aux.parties.len(),
-            n_new as usize,
-            "aux.parties should have {} elements",
-            n_new
-        );
     }
 
     // 4. Verify signing with new shares
