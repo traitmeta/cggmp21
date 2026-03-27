@@ -127,6 +127,8 @@ pub struct ReshareConfig<E: Curve> {
     pub new_parties: Vec<u16>,
     /// The shared public key (for verification)
     pub shared_public_key: NonZero<Point<E>>,
+    /// New threshold for the output shares. None = n_new-of-n_new (all must sign)
+    pub new_threshold: Option<u16>,
 }
 
 impl<E: Curve> ReshareConfig<E> {
@@ -140,7 +142,42 @@ impl<E: Curve> ReshareConfig<E> {
             old_parties,
             new_parties,
             shared_public_key,
+            new_threshold: None,
         }
+    }
+
+    /// Create a new reshare configuration with a specific new threshold
+    ///
+    /// # Panics
+    /// Panics if `new_threshold < 2` or `new_threshold > new_parties.len()`
+    pub fn with_new_threshold(
+        old_parties: Vec<u16>,
+        new_parties: Vec<u16>,
+        shared_public_key: NonZero<Point<E>>,
+        new_threshold: u16,
+    ) -> Self {
+        assert!(
+            new_threshold >= 2,
+            "new_threshold must be >= 2, got {}",
+            new_threshold
+        );
+        assert!(
+            new_threshold <= new_parties.len() as u16,
+            "new_threshold ({}) must be <= n_new ({})",
+            new_threshold,
+            new_parties.len()
+        );
+        Self {
+            old_parties,
+            new_parties,
+            shared_public_key,
+            new_threshold: Some(new_threshold),
+        }
+    }
+
+    /// Effective new threshold: new_threshold if set, otherwise n_new (all must sign)
+    pub fn effective_new_threshold(&self) -> u16 {
+        self.new_threshold.unwrap_or(self.n_new())
     }
 
     /// Number of old participants
@@ -365,7 +402,7 @@ where
                 old_share,
                 self.config,
                 primes,
-                None, // reliability check not fully implemented logic yet
+                self.tracer,
                 self.reliable_broadcast,
             )
             .await
@@ -517,7 +554,6 @@ struct Polynomial<E: Curve> {
 }
 
 impl<E: Curve> Polynomial<E> {
-    #[allow(dead_code)]
     fn new_with_secret<R: RngCore + CryptoRng>(
         rng: &mut R,
         secret: &SecretScalar<E>,
@@ -525,22 +561,6 @@ impl<E: Curve> Polynomial<E> {
     ) -> Self {
         let mut coefficients = Vec::with_capacity(degree + 1);
         coefficients.push(secret.clone());
-        for _ in 0..degree {
-            coefficients.push(SecretScalar::random(rng));
-        }
-        Self { coefficients }
-    }
-
-    #[allow(dead_code)]
-    fn new_with_secret_nonzero<R: RngCore + CryptoRng>(
-        rng: &mut R,
-        secret: &NonZero<SecretScalar<E>>,
-        degree: usize,
-    ) -> Self {
-        let mut coefficients = Vec::with_capacity(degree + 1);
-        // Use deref to get the inner SecretScalar
-        let inner: &SecretScalar<E> = &**secret;
-        coefficients.push(inner.clone());
         for _ in 0..degree {
             coefficients.push(SecretScalar::random(rng));
         }
@@ -640,10 +660,8 @@ where
         // 如果你只是旧参与者（不留任），仅需执行以下步骤：
         // 1. 计算 Lagrange 插值系数，生成用于 Key Refresh 的 additive share。
         // 2. 生成随机多项式并分发 VSS 份额。
-        let lambda = if let Some(vss) = old_core.key_info.vss_setup.as_ref() {
-            let threshold = vss.min_signers as usize;
-            let active_old_parties: Vec<u16> =
-                config.old_parties.iter().take(threshold).cloned().collect();
+        let lambda = if old_core.key_info.vss_setup.is_some() {
+            let active_old_parties: Vec<u16> = config.old_parties.clone();
             if let Some(pos) = active_old_parties.iter().position(|&id| id == my_old_index) {
                 let active_x_coords: Vec<Scalar<E>> = active_old_parties
                     .iter()
@@ -672,6 +690,7 @@ where
             &config,
             refreshed_share,
             None,
+            (config.effective_new_threshold() - 1) as usize,
         )
         .await?;
 
@@ -685,14 +704,11 @@ where
     // Or we handle Dealer sending manually, then switch to Receiver flow.
 
     // 1. Perform Dealer Distribution
-    // 1. Perform Dealer Distribution
     tracer.stage("Phase 1: Key Refresh (Lagrange)");
 
     // Threshold Selection for Retained Party too
-    let lambda = if let Some(vss) = old_core.key_info.vss_setup.as_ref() {
-        let threshold = vss.min_signers as usize;
-        let active_old_parties: Vec<u16> =
-            config.old_parties.iter().take(threshold).cloned().collect();
+    let lambda = if old_core.key_info.vss_setup.is_some() {
+        let active_old_parties: Vec<u16> = config.old_parties.clone();
         if let Some(pos) = active_old_parties.iter().position(|&id| id == my_old_index) {
             let active_x_coords: Vec<Scalar<E>> = active_old_parties
                 .iter()
@@ -721,6 +737,7 @@ where
         &config,
         refreshed_share,
         Some(my_old_index),
+        (config.effective_new_threshold() - 1) as usize,
     )
     .await?;
 
@@ -763,6 +780,7 @@ async fn perform_vss_distribution<R, S, E, L, D, ESend>(
     config: &ReshareConfig<E>,
     secret: SecretScalar<E>,
     my_new_index_if_retained: Option<u16>,
+    polynomial_degree: usize,
 ) -> Result<(MsgFeldmanCommitment<E>, Option<MsgShareDistribution<E>>), DynamicReshareError>
 where
     R: RngCore + CryptoRng,
@@ -773,8 +791,7 @@ where
     ESend: std::error::Error + Send + Sync + 'static,
 {
     // Implementation of Polynomial generation and broadcast
-    let n_new = config.n_new();
-    let polynomial = Polynomial::new_with_secret(rng, &secret, (n_new - 1) as usize);
+    let polynomial = Polynomial::new_with_secret(rng, &secret, polynomial_degree);
 
     let commitment = polynomial.feldman_commit();
     let msg_commitment = MsgFeldmanCommitment {
@@ -1046,10 +1063,6 @@ where
     let rho_bytes = combined_rho;
 
     tracer.stage("Phase 2: VSS Reshare");
-    let n_new = config.n_new();
-    let _my_position = config
-        .new_party_position(my_new_index)
-        .ok_or(DynamicReshareError::ConfigurationMismatch)? as u16;
 
     let mut commitments = rounds
         .complete(commitment_round)
@@ -1109,25 +1122,15 @@ where
     }
 
     // Compute the new shared public key from the commitments
+    // The shared public key = sum of constant terms (evaluation at x=0)
     let mut computed_public_key = Point::<E>::zero();
     for c in commitments.values() {
-        let mut dealer_contribution = Point::<E>::zero();
-        let x_power = Scalar::<E>::one();
-        // The shared public key is the evaluation of the sum of polynomials at x=0
-        // which is the sum of the constant terms (coefficients[0])
-        dealer_contribution = dealer_contribution + c.commitment[0] * x_power;
-        computed_public_key = computed_public_key + dealer_contribution;
+        computed_public_key = computed_public_key + c.commitment[0];
     }
     // 验证计算出的公钥是否与配置的共享公钥一致。
     // 这一步确保了所有 Dealer 的常数项之和确实等于原私钥（对应的公钥）。
 
     if computed_public_key != config.shared_public_key.into_inner() {
-        eprintln!("DEBUG: PublicKeyMismatch Failure");
-        eprintln!("  Expected: {:?}", config.shared_public_key.into_inner());
-        eprintln!("  Computed: {:?}", computed_public_key);
-        for (pid, c) in &commitments {
-            eprintln!("  Dealer {} C0: {:?}", pid, c.commitment[0]);
-        }
         return Err(DynamicReshareError::PublicKeyMismatch);
     }
 
@@ -1182,7 +1185,7 @@ where
     // 阶段 3：最终证明
     // 证明我们生成的私钥 x_new 与我们的 Paillier 密钥 N 绑定，
     // 且我们确实知道 x_new 的离散对数。
-    let my_aux = &verified_auxes[config.new_party_position(my_new_index).unwrap()];
+    let my_aux = &verified_auxes[my_position];
     let N = &my_aux.N;
     let s = &my_aux.s;
     let t = &my_aux.t;
@@ -1358,7 +1361,7 @@ where
     // - public_shares: 只包含实际参与者，按 new_parties 顺序排列（长度 = n_new）
     // - vss_setup.I: 存储求值点 Scalar(party_id+1)，用于 Lagrange 插值（长度 = n_new）
     // - aux.parties: 按 new_parties 顺序排列（长度 = n_new）
-    // - 由于 i 是位置索引，new_parties 可以是任意非连续的 party ID
+    // - 注意：new_parties 必须是从 0 开始的连续索引（签名协议要求 S[j] < n）
     let new_core_share = DirtyIncompleteKeyShare {
         i: my_position as u16,
         key_info: DirtyKeyInfo {
@@ -1366,7 +1369,7 @@ where
             shared_public_key: config.shared_public_key,
             public_shares,
             vss_setup: Some(crate::key_share::VssSetup {
-                min_signers: n_new,
+                min_signers: config.effective_new_threshold(),
                 // 只包含实际参与者的索引，不填充
                 // I 和 public_shares 通过 zip 一一对应
                 I: config
@@ -1383,8 +1386,8 @@ where
     .validate()
     .map_err(|err| Bug::InvalidShareGenerated(err.into_error().into()))?;
 
-    // 不填充 AuxInfo，直接使用 verified_auxes
-    // 这要求 new_parties 是连续的，这样 aux.parties[i] 对应索引为 i 的参与者
+    // 直接使用 verified_auxes（已按 new_parties 顺序排列），
+    // aux.parties[i] 对应位置索引为 i 的参与者
     let final_auxes = verified_auxes;
 
     let aux = DirtyAuxInfo {
