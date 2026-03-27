@@ -10,9 +10,20 @@ cggmp21_tests::test_suite! {
     test: dynamic_reshare_works,
     generics: all_curves,
     suites: {
-        n3_replace_all: (3, 3, false, 0),
-        n3_overlap_1: (3, 3, false, 1),
-        n2_to_n3: (2, 3, false, 0),
+        // Existing: additive (n-of-n) reshare
+        n3_replace_all: (3, 3, false, 0, None, None, None),
+        n3_overlap_1: (3, 3, false, 1, None, None, None),
+        n2_to_n3: (2, 3, false, 0, None, None, None),
+        // Threshold reshare: same group size
+        t2n3_to_t2n3: (3, 3, false, 0, Some(2), Some(2), None),
+        t2n3_to_n3: (3, 3, false, 0, Some(2), None, None),
+        n3_to_t2n3: (3, 3, false, 0, None, Some(2), None),
+        // Threshold reshare: expand group
+        t2n3_to_t2n4: (3, 4, false, 0, Some(2), Some(2), None),
+        // Threshold reshare: shrink group
+        t2n3_to_t2n2: (3, 2, false, 0, Some(2), Some(2), None),
+        // More than t old parties participating (overdetermined Lagrange)
+        t3n5_4_old_to_t3n5: (5, 5, false, 0, Some(3), Some(3), Some(4)),
     }
 }
 
@@ -33,34 +44,55 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
     n_new: u16,
     reliable_broadcast: bool,
     _overlap_count: u16,
+    old_threshold: Option<u16>,
+    new_threshold: Option<u16>,
+    old_participants: Option<u16>,
 ) where
     Point<E>: generic_ec::coords::HasAffineX<E>,
 {
     let mut rng = rand_dev::DevRng::new();
 
     // 1. Get initial shares for old parties
+    // If old_threshold is set, fetch threshold shares; otherwise fetch additive shares
     let old_shares = cggmp21_tests::CACHED_SHARES
-        .get_shares::<E, SecurityLevel128>(None, n_old, true)
+        .get_shares::<E, SecurityLevel128>(old_threshold, n_old, true)
         .expect("retrieve cached shares");
 
-    let old_parties: Vec<u16> = (0..n_old).collect();
+    // Determine how many old parties participate:
+    // - old_participants overrides (for testing overdetermined Lagrange)
+    // - otherwise old_threshold (exactly t parties)
+    // - otherwise n_old (all parties, for additive shares)
+    let participating_count = old_participants
+        .or(old_threshold)
+        .unwrap_or(n_old);
+    let old_parties: Vec<u16> = (0..participating_count).collect();
+
     // New parties MUST use consecutive indices starting from 0
     // This is a requirement of cggmp21's VSS design
     let new_parties: Vec<u16> = (0..n_new).collect();
 
     // shared_public_key is already NonZero<Point<E>>
     let shared_public_key = old_shares[0].core.shared_public_key;
-    let config = ReshareConfig::new(old_parties.clone(), new_parties.clone(), shared_public_key);
+    let config = if let Some(nt) = new_threshold {
+        ReshareConfig::with_new_threshold(
+            old_parties.clone(),
+            new_parties.clone(),
+            shared_public_key,
+            nt,
+        )
+    } else {
+        ReshareConfig::new(old_parties.clone(), new_parties.clone(), shared_public_key)
+    };
 
     let mut primes = cggmp21_tests::CACHED_PRIMES.iter::<SecurityLevel128>();
 
     // Create setup for all parties
     let mut party_setups: Vec<PartySetup<E>> = Vec::new();
 
-    // Old parties (dealers)
-    for (_i, share) in old_shares.iter().enumerate() {
-        let old_id = share.core.i;
-        let primes = if new_parties.contains(&old_id) {
+    // Old parties (dealers) — only the participating ones
+    for &old_idx in &old_parties {
+        let share = old_shares[old_idx as usize].clone();
+        let primes = if new_parties.contains(&old_idx) {
             Some(
                 primes
                     .next()
@@ -70,7 +102,7 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
             None
         };
         party_setups.push(PartySetup::Dealer {
-            old_share: share.clone(),
+            old_share: share,
             primes,
         });
     }
@@ -140,14 +172,20 @@ fn dynamic_reshare_works<E: generic_ec::Curve + Unpin>(
     }
 
     // 4. Verify signing with new shares
+    // If new_threshold is set, only use t' signers; otherwise use all
     let eid: [u8; 32] = rng.gen();
     let eid = ExecutionId::new(&eid);
 
     let message_to_sign = cggmp21::signing::DataToSign::digest::<Sha256>(&[42; 100]);
 
-    let signers = new_parties.clone();
+    let signing_count = new_threshold.unwrap_or(n_new);
+    let signers: Vec<u16> = new_parties.iter().take(signing_count as usize).cloned().collect();
+    let signing_shares: Vec<_> = new_key_shares
+        .iter()
+        .filter(|s| signers.contains(&s.core.i))
+        .collect();
 
-    let sig = round_based::sim::run_with_setup(&new_key_shares, |_, party, share| {
+    let sig = round_based::sim::run_with_setup(&signing_shares, |_, party, share| {
         let party = cggmp21_tests::buffer_outgoing(party);
         let mut party_rng = rng.fork();
         let signers = signers.clone();
