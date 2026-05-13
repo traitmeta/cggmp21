@@ -121,14 +121,20 @@ macro_rules! prefixed {
 /// Configuration for dynamic reshare protocol
 #[derive(Clone, Debug)]
 pub struct ReshareConfig<E: Curve> {
-    /// Indices of old participants (dealers)
+    /// Indices of old participants (dealers) — protocol-local positions in the union
     pub old_parties: Vec<u16>,
-    /// Indices of new participants (receivers)
+    /// Indices of new participants (receivers) — protocol-local positions in the union
     pub new_parties: Vec<u16>,
     /// The shared public key (for verification)
     pub shared_public_key: NonZero<Point<E>>,
     /// New threshold for the output shares. None = n_new-of-n_new (all must sign)
     pub new_threshold: Option<u16>,
+    /// Stored KeyShare core.i values for each old party, in same order as `old_parties`.
+    /// Used for Lagrange x-coordinate lookup: vss_setup.I[old_core_indices[k]].
+    /// When old_parties are protocol-local positions that differ from stored core.i,
+    /// this field bridges the coordinate space for correct interpolation.
+    /// If empty, falls back to using old_parties values directly (backward compatible).
+    pub old_core_indices: Vec<u16>,
 }
 
 impl<E: Curve> ReshareConfig<E> {
@@ -143,6 +149,7 @@ impl<E: Curve> ReshareConfig<E> {
             new_parties,
             shared_public_key,
             new_threshold: None,
+            old_core_indices: Vec::new(),
         }
     }
 
@@ -172,6 +179,7 @@ impl<E: Curve> ReshareConfig<E> {
             new_parties,
             shared_public_key,
             new_threshold: Some(new_threshold),
+            old_core_indices: Vec::new(),
         }
     }
 
@@ -400,6 +408,7 @@ where
                 party,
                 self.eid,
                 old_share,
+                self.i,
                 self.config,
                 primes,
                 self.tracer,
@@ -608,11 +617,18 @@ fn verify_share_against_commitment<E: Curve>(
 ///
 /// Returns `Some(KeyShare)` if this dealer is also a new participant (retained),
 /// otherwise returns `None`.
+///
+/// # Coordinate spaces
+/// - `i_local`: protocol-level index (position in union), used for messaging and role detection
+/// - `old_core.i`: stored KeyShare index, used ONLY for vss_setup.I lookup in Lagrange
+/// - `config.old_parties` / `config.new_parties`: protocol-local positions
+/// - `config.old_core_indices`: maps each old_parties entry to its stored core.i
 pub async fn run_reshare_as_dealer<R, M, E, L, D>(
     rng: &mut R,
     party: M,
     sid: ExecutionId<'_>,
     old_share: &impl AnyKeyShare<E>,
+    i_local: u16,
     config: ReshareConfig<E>,
     pregenerated: Option<PregeneratedPrimes<L>>,
     mut tracer: Option<&mut dyn Tracer>,
@@ -628,91 +644,37 @@ where
     tracer.protocol_begins();
 
     let old_core = old_share.as_ref();
-    let my_old_index = old_core.i;
+    let my_core_i = old_core.i; // Only used for vss_setup.I[core.i] lookup
 
-    // Verify if we are retained (present in new_parties as ID)
-    // 验证我们是否被留任（作为新参与者存在）。
-    //
-    // 关键修改：retained party 的新索引可能与旧索引不同！
-    // 我们通过在 new_parties 中查找 my_old_index 来确定新索引。
-    // 如果找到，说明被留任，新索引是在 new_parties 中的位置对应的值。
-    let my_new_index_option = config
-        .new_parties
-        .iter()
-        .find(|&&idx| idx == my_old_index)
-        .copied();
-
-    let is_retained = my_new_index_option.is_some();
-    let my_new_index = my_new_index_option;
+    // Retained detection: use i_local (protocol space) to check new_parties (protocol space)
+    // No coordinate bridging needed — both are in the same space.
+    let is_retained = config.new_parties.contains(&i_local);
 
     tracer.stage("Setup networking");
     let MpcParty { delivery, .. } = party.into_party();
     let (incomings, mut outgoings) = delivery.split();
 
-    // Setup RoundsRouter
-    // Old parties technically only need to Send VSS messages.
-    // But if retained, they act as Receivers too.
-    // If not retained, we just send and exit.
-
-    if !is_retained {
-        tracer.stage("Phase 1: Key Refresh (Lagrange)");
-        // Threshold Selection / Additive Logic
-        // 如果你只是旧参与者（不留任），仅需执行以下步骤：
-        // 1. 计算 Lagrange 插值系数，生成用于 Key Refresh 的 additive share。
-        // 2. 生成随机多项式并分发 VSS 份额。
-        let lambda = if old_core.key_info.vss_setup.is_some() {
-            let active_old_parties: Vec<u16> = config.old_parties.clone();
-            if let Some(pos) = active_old_parties.iter().position(|&id| id == my_old_index) {
-                let active_x_coords: Vec<Scalar<E>> = active_old_parties
-                    .iter()
-                    .map(|&idx| Scalar::<E>::from(idx + 1))
-                    .collect();
-                generic_ec_zkp::polynomial::lagrange_coefficient_at_zero(pos, &active_x_coords)
-                    .ok_or(Bug::PartyIndexOutOfBounds)?
-                    .into_inner()
-            } else {
-                Scalar::zero()
-            }
+    // --- Compute Lagrange coefficient (shared by both retained and non-retained paths) ---
+    // Position: find ourselves in old_core_indices by matching our stored core.i
+    // X-coordinates: vss_setup.I[core_i] for each old party
+    let lambda = if let Some(ref vss_setup) = old_core.key_info.vss_setup {
+        let core_indices = if !config.old_core_indices.is_empty() {
+            &config.old_core_indices
         } else {
-            Scalar::one()
+            // Backward compat: old_parties values ARE core.i (only true when they match)
+            &config.old_parties
         };
-
-        let secret_ref: &Scalar<E> = old_core.x.as_ref();
-        let mut share_scalar = lambda * secret_ref;
-        let refreshed_share = SecretScalar::new(&mut share_scalar);
-
-        tracer.stage("Phase 2: VSS Distribution");
-        perform_vss_distribution(
-            rng,
-            &mut outgoings,
-            sid,
-            my_old_index,
-            &config,
-            refreshed_share,
-            None,
-            (config.effective_new_threshold() - 1) as usize,
-        )
-        .await?;
-
-        tracer.protocol_ends();
-        return Ok(None);
-    }
-
-    // Logic for retained party (Simulate becoming a "New Party" + Doing Dealer job)
-    // We must run Dealer logic AND Receiver logic.
-    // To do this cleanly with `round_based`, we typically need one router.
-    // Or we handle Dealer sending manually, then switch to Receiver flow.
-
-    // 1. Perform Dealer Distribution
-    tracer.stage("Phase 1: Key Refresh (Lagrange)");
-
-    // Threshold Selection for Retained Party too
-    let lambda = if old_core.key_info.vss_setup.is_some() {
-        let active_old_parties: Vec<u16> = config.old_parties.clone();
-        if let Some(pos) = active_old_parties.iter().position(|&id| id == my_old_index) {
-            let active_x_coords: Vec<Scalar<E>> = active_old_parties
+        let my_pos = core_indices.iter().position(|&ci| ci == my_core_i);
+        if let Some(pos) = my_pos {
+            let active_x_coords: Vec<Scalar<E>> = core_indices
                 .iter()
-                .map(|&idx| Scalar::<E>::from(idx + 1))
+                .map(|&ci| {
+                    vss_setup
+                        .I
+                        .get(usize::from(ci))
+                        .map(|s| s.into_inner())
+                        .unwrap_or_else(|| Scalar::<E>::from(ci + 1))
+                })
                 .collect();
             generic_ec_zkp::polynomial::lagrange_coefficient_at_zero(pos, &active_x_coords)
                 .ok_or(Bug::PartyIndexOutOfBounds)?
@@ -728,42 +690,49 @@ where
     let mut share_scalar = lambda * secret_ref;
     let refreshed_share = SecretScalar::new(&mut share_scalar);
 
+    if !is_retained {
+        // Non-retained (leaving) dealer: distribute shares and exit
+        tracer.stage("Phase 2: VSS Distribution");
+        perform_vss_distribution(
+            rng,
+            &mut outgoings,
+            sid,
+            i_local,
+            &config,
+            refreshed_share,
+            None,
+            (config.effective_new_threshold() - 1) as usize,
+        )
+        .await?;
+
+        tracer.protocol_ends();
+        return Ok(None);
+    }
+
+    // --- Retained party: deal shares AND receive new share ---
     tracer.stage("Phase 2: VSS Distribution");
     let (self_commitment, self_share_msg) = perform_vss_distribution(
         rng,
         &mut outgoings,
         sid,
-        my_old_index,
+        i_local,
         &config,
         refreshed_share,
-        Some(my_old_index),
+        Some(i_local),
         (config.effective_new_threshold() - 1) as usize,
     )
     .await?;
-
-    // 2. Perform Receiver Logic
-    // We already consumed `outgoings`? NO, pass by mut ref.
-    // But `incomings` need to be handled.
-    // New logic: `run_reshare_as_receiver` expects `party`.
-    // But we already split `party`.
-    // So we should inline the receiver logic or refactor `run_reshare_as_receiver`
-    // to take `incomings/outgoings`.
-
-    // I will refactor `run_reshare_as_receiver` to take `delivery` or `incomings/outgoings`?
-    // Usually `run_...` takes `Mpc`.
-    // I'll instantiate a `MpcParty` from the split channels? Hard.
-    // Easier: Call internal helper `run_reshare_core`.
 
     let key_share = run_reshare_core(
         rng,
         incomings,
         outgoings,
         sid,
-        my_new_index.unwrap(),
+        i_local,
         config,
         pregenerated.ok_or(Bug::PaillierKeyError)?,
         tracer,
-        self_share_msg.map(|msg| (my_old_index, msg)),
+        self_share_msg.map(|msg| (i_local, msg)),
         Some(self_commitment),
         reliable_broadcast_enforced,
     )
